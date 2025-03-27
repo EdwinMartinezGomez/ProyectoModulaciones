@@ -4,6 +4,8 @@ import PyQt5.QtWidgets as QtWidgets
 from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.animation import FuncAnimation
+import scipy
+import scipy.signal
 import sounddevice as sd
 import scipy.signal as signal
 
@@ -138,7 +140,13 @@ class ModulationSimulator(QtWidgets.QWidget):
         if self.audio_data is not None:
             return np.interp(t, np.linspace(0, 1, len(self.audio_data)), self.audio_data)
         return np.zeros_like(t)
-
+    
+    def apply_bandpass_filter(self, signal, lowcut, highcut, fs, order=4):
+        nyquist = 0.5 * fs
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = scipy.signal.butter(order, [low, high], btype='band')
+        return scipy.signal.filtfilt(b, a, signal)
 
     def apply_modulation(self, mod_type, message, carrier, t):
         """Aplica la modulación seleccionada y hace la demodulación correcta."""
@@ -169,7 +177,7 @@ class ModulationSimulator(QtWidgets.QWidget):
 
             elif mod_type == "FSK":
                 f1 = self.freq_carrier.value()
-                f2 = f1 + 50  # Subimos el salto para que la demodulación sea más clara
+                f2 = f1 + 100 
 
                 samples_per_bit = int(len(t) / len(message))
                 duration = t[-1] - t[0]
@@ -178,9 +186,6 @@ class ModulationSimulator(QtWidgets.QWidget):
                 modulated = np.zeros(len(t))
                 phase = 0
 
-                # ===========================
-                # Modulación FSK (fase continua)
-                # ===========================
                 for i, bit in enumerate(message):
                     start = i * samples_per_bit
                     end = (i + 1) * samples_per_bit
@@ -189,35 +194,28 @@ class ModulationSimulator(QtWidgets.QWidget):
                     modulated[start:end] = np.sin(phase + 2 * np.pi * freq * t_rel)
                     phase += 2 * np.pi * freq * (t[end-1] - t[start]) + 2 * np.pi * freq * (t[1] - t[0])
 
-                # ===============================
-                # DEMODULACIÓN FSK (Detector de Energía)
-                # ===============================
-                demodulated_bits = []
+                low_f1 = max(f1 - 30, 1)
+                high_f1 = max(f1 + 30, low_f1 + 1)
+                low_f2 = max(f2 - 30, 1)
+                high_f2 = max(f2 + 30, low_f2 + 1)
 
-                for i in range(len(message)):
-                    start = i * samples_per_bit
-                    end = (i + 1) * samples_per_bit
+                filtered_f1 = self.apply_bandpass_filter(modulated, low_f1, high_f1, sampling_rate)
+                filtered_f2 = self.apply_bandpass_filter(modulated, low_f2, high_f2, sampling_rate)
 
-                    segment = modulated[start:end]
-                    t_rel = np.linspace(0, bit_duration, samples_per_bit, endpoint=False)
+                energy_f1 = np.array([np.sum(filtered_f1[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
+                energy_f2 = np.array([np.sum(filtered_f2[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
 
-                    ref1 = np.sin(2 * np.pi * f1 * t_rel)
-                    ref2 = np.sin(2 * np.pi * f2 * t_rel)
+                threshold = (np.max(energy_f1) + np.max(energy_f2)) / 2
+                demodulated_bits = (energy_f2 > energy_f1).astype(int)
 
-                    # Producto escalar (correlación coherente)
-                    corr_f1 = np.dot(segment, ref1)
-                    corr_f2 = np.dot(segment, ref2)
-
-                    # Determinación por energía
-                    bit = 1 if corr_f2 ** 2 > corr_f1 ** 2 else 0
-                    demodulated_bits.append(bit)
-
-                # Reconstruir señal para graficar
                 demodulated = np.zeros(len(t))
                 for i, bit in enumerate(demodulated_bits):
                     start = i * samples_per_bit
                     end = (i + 1) * samples_per_bit
                     demodulated[start:end] = bit
+
+                from scipy.signal import medfilt
+                demodulated = medfilt(demodulated, kernel_size=5)
 
             elif mod_type == "PSK":
                 modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
