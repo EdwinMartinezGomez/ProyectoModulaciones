@@ -5,6 +5,7 @@ from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.animation import FuncAnimation
 import sounddevice as sd
+import scipy.signal as signal
 
 class ModulationSimulator(QtWidgets.QWidget):
     def __init__(self):
@@ -138,30 +139,103 @@ class ModulationSimulator(QtWidgets.QWidget):
             return np.interp(t, np.linspace(0, 1, len(self.audio_data)), self.audio_data)
         return np.zeros_like(t)
 
+
     def apply_modulation(self, mod_type, message, carrier, t):
-        """Aplica la modulación seleccionada."""
+        """Aplica la modulación seleccionada y hace la demodulación correcta."""
         try:
+            sampling_rate = len(t)
+
             if mod_type == "AM":
                 modulated = (1 + message) * carrier
-                demodulated = np.abs(modulated) - 1
+                analytic = signal.hilbert(modulated)
+                demodulated = np.abs(analytic) - 1
+
             elif mod_type == "FM":
                 modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + 2 * np.pi * message)
-                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
+                analytic = signal.hilbert(modulated)
+                instantaneous_phase = np.unwrap(np.angle(analytic))
+                instantaneous_frequency = np.gradient(instantaneous_phase) * sampling_rate / (2 * np.pi)
+                demodulated = instantaneous_frequency - self.freq_carrier.value()
+
             elif mod_type == "PM":
                 modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
-                demodulated = np.unwrap(np.angle(modulated))
+                analytic = signal.hilbert(modulated)
+                instantaneous_phase = np.unwrap(np.angle(analytic))
+                demodulated = instantaneous_phase
+
             elif mod_type == "ASK":
                 modulated = (message > 0) * carrier
-                demodulated = (modulated > 0).astype(float)
+                demodulated = (modulated * carrier) > 0
+
             elif mod_type == "FSK":
-                modulated = np.sin(2 * np.pi * (self.freq_carrier.value() + message * 10) * t)
-                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
+                f1 = self.freq_carrier.value()
+                f2 = f1 + 50  # Subimos el salto para que la demodulación sea más clara
+
+                samples_per_bit = int(len(t) / len(message))
+                duration = t[-1] - t[0]
+                bit_duration = duration / len(message)
+
+                modulated = np.zeros(len(t))
+                phase = 0
+
+                # ===========================
+                # Modulación FSK (fase continua)
+                # ===========================
+                for i, bit in enumerate(message):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+                    freq = f2 if bit == 1 else f1
+                    t_rel = t[start:end] - t[start]
+                    modulated[start:end] = np.sin(phase + 2 * np.pi * freq * t_rel)
+                    phase += 2 * np.pi * freq * (t[end-1] - t[start]) + 2 * np.pi * freq * (t[1] - t[0])
+
+                # ===============================
+                # DEMODULACIÓN FSK (Detector de Energía)
+                # ===============================
+                demodulated_bits = []
+
+                for i in range(len(message)):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+
+                    segment = modulated[start:end]
+                    t_rel = np.linspace(0, bit_duration, samples_per_bit, endpoint=False)
+
+                    ref1 = np.sin(2 * np.pi * f1 * t_rel)
+                    ref2 = np.sin(2 * np.pi * f2 * t_rel)
+
+                    # Producto escalar (correlación coherente)
+                    corr_f1 = np.dot(segment, ref1)
+                    corr_f2 = np.dot(segment, ref2)
+
+                    # Determinación por energía
+                    bit = 1 if corr_f2 ** 2 > corr_f1 ** 2 else 0
+                    demodulated_bits.append(bit)
+
+                # Reconstruir señal para graficar
+                demodulated = np.zeros(len(t))
+                for i, bit in enumerate(demodulated_bits):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+                    demodulated[start:end] = bit
+
             elif mod_type == "PSK":
-                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * (message > 0))
-                demodulated = np.unwrap(np.angle(modulated))
+                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
+
+                # Demodulación coherente
+                carrier_ref = np.sin(2 * np.pi * self.freq_carrier.value() * t)
+                mixed = modulated * carrier_ref
+
+                # Filtro pasa bajos (promedio móvil)
+                kernel_size = 50
+                filtered = np.convolve(mixed, np.ones(kernel_size) / kernel_size, mode='same')
+
+                demodulated = (filtered < 0).astype(float)
+
             elif mod_type == "PCM":
                 modulated = np.round(message * 2) / 2
                 demodulated = modulated
+
             else:
                 modulated = demodulated = np.zeros_like(t)
 
