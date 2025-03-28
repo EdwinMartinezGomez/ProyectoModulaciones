@@ -1,19 +1,18 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import PyQt5.QtWidgets as QtWidgets
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.animation import FuncAnimation
-import scipy
-import scipy.signal
 import sounddevice as sd
-import scipy.signal as signal
+from scipy.fft import fft, fftfreq
+from scipy.signal import hilbert
 
 class ModulationSimulator(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Simulación de Modulación")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 800, 800)
 
         # Layout principal
         self.layout = QtWidgets.QVBoxLayout()
@@ -39,19 +38,32 @@ class ModulationSimulator(QtWidgets.QWidget):
         self.record_button.clicked.connect(self.record_audio)
         self.layout.addWidget(self.record_button)
 
+        # Indicador de grabación
+        self.recording_indicator = QtWidgets.QLabel("")
+        self.layout.addWidget(self.recording_indicator)
+
         # Controles de frecuencia
         self.freq_msg, self.freq_msg_label = self.create_slider("Frecuencia de mensaje", 1, 20, 5)
         self.freq_carrier, self.freq_carrier_label = self.create_slider("Frecuencia de portadora", 5, 50, 20)
 
-        # Gráficos
+        # Control de desviación de fase para PM
+        self.phase_dev, self.phase_dev_label = self.create_slider("Desviación de fase (PM)", 1, 10, 5)
+
+        # Gráficos principales
         self.fig, self.axs = plt.subplots(4, 1, figsize=(8, 10), tight_layout=True)
         self.canvas = FigureCanvas(self.fig)
         self.layout.addWidget(self.canvas)
 
+        # Gráfico adicional para el espectro
+        self.fig_spectrum, self.ax_spectrum = plt.subplots(figsize=(8, 3), tight_layout=True)
+        self.canvas_spectrum = FigureCanvas(self.fig_spectrum)
+        self.layout.addWidget(self.canvas_spectrum)
+
         self.audio_data = None
+        self.is_recording = False
 
         # Animación en tiempo real
-        self.anim = FuncAnimation(self.fig, self.update_plot, interval=100)
+        self.anim = FuncAnimation(self.fig, self.update_plot, interval=100, cache_frame_data=False, save_count=50)
 
         self.toggle_input_method()
 
@@ -62,7 +74,7 @@ class ModulationSimulator(QtWidgets.QWidget):
         slider.setMaximum(max_val)
         slider.setValue(default)
         slider.valueChanged.connect(self.update_labels)
-        slider_label = QtWidgets.QLabel(f"{label}: {slider.value()} Hz")
+        slider_label = QtWidgets.QLabel(f"{label}: {slider.value()}")
         self.layout.addWidget(slider_label)
         self.layout.addWidget(slider)
         return slider, slider_label
@@ -73,22 +85,40 @@ class ModulationSimulator(QtWidgets.QWidget):
         is_digital = mod_type in ["ASK", "FSK", "PSK", "PCM"]
         self.text_input.setEnabled(is_digital)
         self.record_button.setEnabled(not is_digital)
+        # Mostrar/ocultar control de desviación de fase según modulación
+        self.phase_dev.setVisible(mod_type == "PM")
+        self.phase_dev_label.setVisible(mod_type == "PM")
 
     def record_audio(self):
         """Graba audio de entrada y lo convierte en una señal usable."""
-        try:
-            duration = 5  # Duración de la grabación en segundos
-            self.audio_data = sd.rec(int(duration * 44100), samplerate=44100, channels=1, dtype='float32')
-            sd.wait()
+        if not self.is_recording:
+            self.is_recording = True
+            self.record_button.setText("Detener Grabación")
+            self.recording_indicator.setText("Grabando...")
+            QTimer.singleShot(5000, self.stop_recording)  # Grabar durante 5 segundos
+            try:
+                duration = 5  # Duración de la grabación en segundos
+                self.audio_data = sd.rec(int(duration * 44100), samplerate=44100, channels=1, dtype='float32')
+            except Exception as e:
+                print(f"Error en la grabación: {e}")
+                self.audio_data = None
+        else:
+            self.stop_recording()
+
+    def stop_recording(self):
+        """Detiene la grabación de audio."""
+        self.is_recording = False
+        self.record_button.setText("Grabar Audio")
+        self.recording_indicator.setText("")
+        sd.wait()
+        if self.audio_data is not None:
             self.audio_data = self.audio_data.flatten()
-        except Exception as e:
-            print(f"Error en la grabación: {e}")
-            self.audio_data = None
 
     def update_labels(self):
         """Actualiza las etiquetas de los sliders."""
         self.freq_msg_label.setText(f"Frecuencia de mensaje: {self.freq_msg.value()} Hz")
         self.freq_carrier_label.setText(f"Frecuencia de portadora: {self.freq_carrier.value()} Hz")
+        self.phase_dev_label.setText(f"Desviación de fase: {self.phase_dev.value()/10.0}π rad")
 
     def generate_signals(self):
         """Genera las señales para la simulación de modulación."""
@@ -105,6 +135,10 @@ class ModulationSimulator(QtWidgets.QWidget):
 
             # Asegurar que `message` tenga la misma longitud que `t`
             message = self.ensure_length(message, len(t))
+
+            # Normalizar la señal de mensaje para PM
+            if mod_type == "PM":
+                message = message / np.max(np.abs(message)) if np.max(np.abs(message)) > 0 else message
 
             # Generar la portadora
             carrier = np.sin(2 * np.pi * self.freq_carrier.value() * t)
@@ -126,11 +160,21 @@ class ModulationSimulator(QtWidgets.QWidget):
         """Convierte texto en una señal binaria."""
         try:
             if text:
-                message = np.array([int(bit) for bit in ''.join(format(ord(c), '08b') for c in text)])
-                message = np.repeat(message, length // len(message))[:length]
+                # Convert text to binary sequence
+                binary_str = ''.join(format(ord(c), '08b') for c in text)
+                # Create square wave signal
+                samples_per_bit = length // len(binary_str)
+                message = np.zeros(length)
+                for i, bit in enumerate(binary_str):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+                    message[start:end] = int(bit)
+                # Ensure we fill the entire length
+                if len(message) < length:
+                    message = np.pad(message, (0, length - len(message)), 'constant')
             else:
                 message = np.zeros(length)
-            return self.ensure_length(message, length)
+            return message
         except Exception as e:
             print(f"Error en text_to_signal: {e}")
             return np.zeros(length)
@@ -140,100 +184,45 @@ class ModulationSimulator(QtWidgets.QWidget):
         if self.audio_data is not None:
             return np.interp(t, np.linspace(0, 1, len(self.audio_data)), self.audio_data)
         return np.zeros_like(t)
-    
-    def apply_bandpass_filter(self, signal, lowcut, highcut, fs, order=4):
-        nyquist = 0.5 * fs
-        low = lowcut / nyquist
-        high = highcut / nyquist
-        b, a = scipy.signal.butter(order, [low, high], btype='band')
-        return scipy.signal.filtfilt(b, a, signal)
 
     def apply_modulation(self, mod_type, message, carrier, t):
-        """Aplica la modulación seleccionada y hace la demodulación correcta."""
+        """Aplica la modulación seleccionada."""
         try:
-            sampling_rate = len(t)
-
             if mod_type == "AM":
                 modulated = (1 + message) * carrier
-                analytic = signal.hilbert(modulated)
-                demodulated = np.abs(analytic) - 1
-
+                demodulated = np.abs(modulated) - 1
             elif mod_type == "FM":
                 modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + 2 * np.pi * message)
-                analytic = signal.hilbert(modulated)
-                instantaneous_phase = np.unwrap(np.angle(analytic))
-                instantaneous_frequency = np.gradient(instantaneous_phase) * sampling_rate / (2 * np.pi)
-                demodulated = instantaneous_frequency - self.freq_carrier.value()
-
+                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
             elif mod_type == "PM":
-                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
-                analytic = signal.hilbert(modulated)
-                instantaneous_phase = np.unwrap(np.angle(analytic))
-                demodulated = instantaneous_phase
-
+                # Improved PM implementation
+                phase_deviation = self.phase_dev.value()/10.0 * np.pi  # Adjustable phase deviation
+                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + phase_deviation * message)
+                analytic_signal = hilbert(modulated)
+                demodulated = np.unwrap(np.angle(analytic_signal))
+                demodulated = demodulated - 2 * np.pi * self.freq_carrier.value() * t  # Remove carrier phase
+                demodulated = demodulated / phase_deviation  # Scale back to original signal
             elif mod_type == "ASK":
-                modulated = (message > 0) * carrier
-                demodulated = (modulated * carrier) > 0
-
+                # Improved ASK implementation
+                high_amplitude = 1.0
+                low_amplitude = 0.0
+                # Create proper digital signal with sharp transitions
+                digital_signal = np.where(message > 0.5, high_amplitude, low_amplitude)
+                modulated = digital_signal * carrier
+                # Improved demodulation using envelope detection
+                demodulated = np.abs(modulated)
+                # Apply threshold to recover digital signal
+                threshold = (high_amplitude + low_amplitude) / 2
+                demodulated = np.where(demodulated > threshold, high_amplitude, low_amplitude)
             elif mod_type == "FSK":
-                f1 = self.freq_carrier.value()
-                f2 = f1 + 100 
-
-                samples_per_bit = int(len(t) / len(message))
-                duration = t[-1] - t[0]
-                bit_duration = duration / len(message)
-
-                modulated = np.zeros(len(t))
-                phase = 0
-
-                for i, bit in enumerate(message):
-                    start = i * samples_per_bit
-                    end = (i + 1) * samples_per_bit
-                    freq = f2 if bit == 1 else f1
-                    t_rel = t[start:end] - t[start]
-                    modulated[start:end] = np.sin(phase + 2 * np.pi * freq * t_rel)
-                    phase += 2 * np.pi * freq * (t[end-1] - t[start]) + 2 * np.pi * freq * (t[1] - t[0])
-
-                low_f1 = max(f1 - 30, 1)
-                high_f1 = max(f1 + 30, low_f1 + 1)
-                low_f2 = max(f2 - 30, 1)
-                high_f2 = max(f2 + 30, low_f2 + 1)
-
-                filtered_f1 = self.apply_bandpass_filter(modulated, low_f1, high_f1, sampling_rate)
-                filtered_f2 = self.apply_bandpass_filter(modulated, low_f2, high_f2, sampling_rate)
-
-                energy_f1 = np.array([np.sum(filtered_f1[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
-                energy_f2 = np.array([np.sum(filtered_f2[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
-
-                threshold = (np.max(energy_f1) + np.max(energy_f2)) / 2
-                demodulated_bits = (energy_f2 > energy_f1).astype(int)
-
-                demodulated = np.zeros(len(t))
-                for i, bit in enumerate(demodulated_bits):
-                    start = i * samples_per_bit
-                    end = (i + 1) * samples_per_bit
-                    demodulated[start:end] = bit
-
-                from scipy.signal import medfilt
-                demodulated = medfilt(demodulated, kernel_size=5)
-
+                modulated = np.sin(2 * np.pi * (self.freq_carrier.value() + message * 10) * t)
+                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
             elif mod_type == "PSK":
-                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
-
-                # Demodulación coherente
-                carrier_ref = np.sin(2 * np.pi * self.freq_carrier.value() * t)
-                mixed = modulated * carrier_ref
-
-                # Filtro pasa bajos (promedio móvil)
-                kernel_size = 50
-                filtered = np.convolve(mixed, np.ones(kernel_size) / kernel_size, mode='same')
-
-                demodulated = (filtered < 0).astype(float)
-
+                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * (message > 0))
+                demodulated = np.unwrap(np.angle(modulated))
             elif mod_type == "PCM":
                 modulated = np.round(message * 2) / 2
                 demodulated = modulated
-
             else:
                 modulated = demodulated = np.zeros_like(t)
 
@@ -242,6 +231,24 @@ class ModulationSimulator(QtWidgets.QWidget):
         except Exception as e:
             print(f"Error en apply_modulation: {e}")
             return np.zeros_like(t), np.zeros_like(t)
+
+    def verify_conversion(self, message_signal, demodulated_signal):
+        """Verifica la precisión de la demodulación."""
+        error = np.abs(message_signal - demodulated_signal)
+        print(f"Error máximo: {np.max(error)}")
+        print(f"Error promedio: {np.mean(error)}")
+
+    def plot_spectrum(self, signal, title):
+        """Grafica el espectro de frecuencia de una señal."""
+        N = len(signal)
+        yf = fft(signal)
+        xf = fftfreq(N, 1 / 1000)  # Asumiendo un muestreo de 1000 Hz
+        self.ax_spectrum.clear()
+        self.ax_spectrum.plot(xf, np.abs(yf))
+        self.ax_spectrum.set_title(title)
+        self.ax_spectrum.set_xlim(0, 100)  # Limit frequency range for better visualization
+        self.ax_spectrum.grid(True)
+        self.canvas_spectrum.draw()
 
     def update_plot(self, frame):
         """Actualiza las gráficas en tiempo real."""
@@ -271,6 +278,12 @@ class ModulationSimulator(QtWidgets.QWidget):
         self.axs[3].set_title("Señal Demodulada")
         self.axs[3].legend()
         self.axs[3].grid(True)
+
+        # Verificar la conversión
+        self.verify_conversion(message, demodulated)
+
+        # Mostrar espectro de la señal modulada
+        self.plot_spectrum(modulated, "Espectro de la Señal Modulada")
 
         # Redibujar el canvas
         self.canvas.draw()
