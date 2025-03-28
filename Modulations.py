@@ -85,9 +85,14 @@ class ModulationSimulator(QtWidgets.QWidget):
     def toggle_input_method(self):
         """Habilita/deshabilita la entrada según el tipo de modulación."""
         mod_type = self.selected_mod.currentText()
-        is_digital = mod_type in ["ASK", "FSK", "PSK", "PCM"]
-        self.text_input.setEnabled(is_digital)
-        self.record_button.setEnabled(not is_digital)
+        # Para modulación digital (ASK, FSK, PSK) se usa texto; en PCM usaremos audio
+        if mod_type == "PCM":
+            self.text_input.setEnabled(False)
+            self.record_button.setEnabled(True)
+        else:
+            is_digital = mod_type in ["ASK", "FSK", "PSK"]
+            self.text_input.setEnabled(is_digital)
+            self.record_button.setEnabled(not is_digital)
         # Mostrar/ocultar control de desviación de fase según modulación
         self.phase_dev.setVisible(mod_type == "PM")
         self.phase_dev_label.setVisible(mod_type == "PM")
@@ -129,11 +134,14 @@ class ModulationSimulator(QtWidgets.QWidget):
             t = np.linspace(0, 1, 1000)  # Vector de tiempo
             mod_type = self.selected_mod.currentText()
 
-            # Generación del mensaje
-            if mod_type in ["ASK", "FSK", "PSK", "PCM"]:
+            # Para PCM usaremos la grabación de audio (o una señal generada si no se grabó)
+            if mod_type == "PCM":
+                message = self.audio_to_signal(t) if self.audio_data is not None else np.sin(2 * np.pi * self.freq_msg.value() * t)
+            elif mod_type in ["ASK", "FSK", "PSK"]:
                 text = self.text_input.text()
                 message = self.text_to_signal(text, len(t))
             else:
+                # Para AM, FM, PM se usa audio o una senoidal
                 message = self.audio_to_signal(t) if self.audio_data is not None else np.sin(2 * np.pi * self.freq_msg.value() * t)
 
             # Asegurar que `message` tenga la misma longitud que `t`
@@ -281,8 +289,91 @@ class ModulationSimulator(QtWidgets.QWidget):
                 demodulated = (filtered < 0).astype(float)
 
             elif mod_type == "PCM":
-                modulated = np.round(message * 2) / 2
-                demodulated = modulated
+                # ==============================
+                # 1) Definir parámetros de PCM
+                # ==============================
+                total_length = 1000      # longitud de la señal en el tiempo de graficación
+                num_levels = 16         # niveles de cuantización (4 bits)
+                bits_per_sample = 4
+                num_samples = 50        # número de muestras que tomaremos de la señal
+                # chunk_size es el número de puntos (en el vector t) que usaremos para representar cada bit
+                # con num_samples=50 y bits_per_sample=4 => total_bits=200 => chunk_size=1000/200=5
+                chunk_size = total_length // (num_samples * bits_per_sample)
+
+                # ==============================
+                # 2) Muestreo de la señal
+                # ==============================
+                # Tomamos 50 muestras uniformemente a lo largo de 'message'
+                sample_indices = np.linspace(0, len(message)-1, num_samples).astype(int)
+                sampled_values = message[sample_indices]
+
+                # Normalizar las muestras a [-1, 1]
+                max_val = np.max(np.abs(sampled_values))
+                if max_val > 0:
+                    sampled_values = sampled_values / max_val
+
+                # ==============================
+                # 3) Cuantización
+                # ==============================
+                # Convertimos cada muestra a un entero entre 0 y num_levels-1
+                quantized_indices = np.round((sampled_values + 1) / 2 * (num_levels - 1)).astype(int)
+                quantized_indices = np.clip(quantized_indices, 0, num_levels - 1)
+
+                # ==============================
+                # 4) Codificación a bits
+                # ==============================
+                bit_array = []
+                for q in quantized_indices:
+                    # 4 bits por muestra
+                    bits_str = format(q, '04b')
+                    bit_array.extend([int(b) for b in bits_str])
+
+                # ==============================
+                # 5) Construir la señal PCM (digital) de longitud 1000
+                #    Cada bit se representará con 'chunk_size' puntos en el tiempo
+                # ==============================
+                modulated_wave = np.zeros(total_length)
+                for i, bit in enumerate(bit_array):
+                    start = i * chunk_size
+                    end = start + chunk_size
+                    if end > total_length:
+                        end = total_length
+                    modulated_wave[start:end] = bit
+
+                # ==============================
+                # 6) Demodulación: leer cada grupo de 4 bits y reconstruir la muestra
+                # ==============================
+                demod_samples = []
+                for i in range(num_samples):
+                    # cada muestra tiene 4 bits => 4 * chunk_size puntos
+                    bit_offset = i * bits_per_sample * chunk_size
+                    current_bits = []
+                    for b in range(bits_per_sample):
+                        chunk_start = bit_offset + b * chunk_size
+                        chunk_end = chunk_start + chunk_size
+                        # Se toma el promedio para decidir si es 0 o 1
+                        bit_val = np.mean(modulated_wave[chunk_start:chunk_end]) > 0.5
+                        current_bits.append(int(bit_val))
+                    # Convertir 4 bits a entero
+                    index_val = current_bits[0]*8 + current_bits[1]*4 + current_bits[2]*2 + current_bits[3]
+                    demod_samples.append(index_val)
+
+                demod_samples = np.array(demod_samples)
+
+                # Mapear de vuelta a [-1, 1]
+                demod_samples = (demod_samples / (num_levels - 1)) * 2 - 1
+
+                # ==============================
+                # 7) Upsample (para graficar) esas 50 muestras a 1000 puntos
+                # ==============================
+                upsampled_demod = np.repeat(demod_samples, chunk_size * bits_per_sample)
+                if len(upsampled_demod) < total_length:
+                    upsampled_demod = np.pad(upsampled_demod, (0, total_length - len(upsampled_demod)), 'edge')
+                else:
+                    upsampled_demod = upsampled_demod[:total_length]
+
+                modulated = modulated_wave
+                demodulated = upsampled_demod
             else:
                 modulated = demodulated = np.zeros_like(t)
 
