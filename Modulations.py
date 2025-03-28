@@ -208,11 +208,60 @@ class ModulationSimulator(QtWidgets.QWidget):
         try:
             sampling_rate = len(t)
             if mod_type == "AM":
-                modulated = (1 + message) * carrier
-                demodulated = np.abs(modulated) - 1
+                # --- AM Mejorada ---
+                # 1) Normalizar mensaje a [-1, 1]
+                if np.max(np.abs(message)) > 0:
+                    msg_norm = message / np.max(np.abs(message))
+                else:
+                    msg_norm = message
+
+                # 2) Parámetros
+                carrier_amplitude = 1.0
+                mod_index = 0.5  # Índice de modulación (0 < m < 1 para AM convencional)
+                
+                # 3) Modulación
+                # s(t) = Ac * [1 + m * msg_norm(t)] * cos(2*pi*fc*t)
+                modulated = carrier_amplitude * (1 + mod_index * msg_norm) * carrier
+
+                # 4) Demodulación mediante detección de envolvente
+                #    a) Obtener la envolvente con transformada de Hilbert
+                analytic_signal = scipy.signal.hilbert(modulated)
+                envelope = np.abs(analytic_signal)
+                
+                #    b) El mensaje recuperado (aprox) = (envelope - Ac) / mod_index
+                #       (restamos la portadora y dividimos entre el índice)
+                demodulated = (envelope - carrier_amplitude) / mod_index
             elif mod_type == "FM":
-                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + 2 * np.pi * message)
-                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
+                # --- FM Mejorada ---
+                # 1) Normalizar mensaje a [-1, 1]
+                if np.max(np.abs(message)) > 0:
+                    msg_norm = message / np.max(np.abs(message))
+                else:
+                    msg_norm = message
+
+                # 2) Parámetros
+                freq_dev = 5.0  # Desviación de frecuencia (Hz)
+                carrier_amplitude = 1.0
+
+                # 3) Construir fase integrada
+                #    s(t) = Ac * cos(2*pi*fc*t + 2*pi*freq_dev * integral(msg_norm))
+                dt = t[1] - t[0]
+                phase_deviation = 2 * np.pi * freq_dev * np.cumsum(msg_norm) * dt
+                total_phase = 2 * np.pi * self.freq_carrier.value() * t + phase_deviation
+                modulated = carrier_amplitude * np.cos(total_phase)
+
+                # 4) Demodulación: derivar la fase instantánea
+                #    a) Obtener señal analítica
+                analytic_signal = scipy.signal.hilbert(modulated)
+                inst_phase = np.unwrap(np.angle(analytic_signal))
+
+                #    b) Frecuencia instantánea = (1 / 2π) * d(phase)/dt
+                #       => (inst_phase[i+1] - inst_phase[i]) / (2π * dt)
+                #       => restar la portadora y escalar por freq_dev
+                inst_freq = np.gradient(inst_phase, dt) / (2.0 * np.pi)
+
+                #    c) Recuperar la señal => (inst_freq - fc) / freq_dev
+                demodulated = (inst_freq - self.freq_carrier.value()) / freq_dev
             elif mod_type == "PM":
                 # Improved PM implementation
                 phase_deviation = self.phase_dev.value()/10.0 * np.pi  # Adjustable phase deviation
