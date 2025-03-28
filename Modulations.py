@@ -207,6 +207,7 @@ class ModulationSimulator(QtWidgets.QWidget):
         """Aplica la modulación seleccionada."""
         try:
             sampling_rate = len(t)
+
             if mod_type == "AM":
                 # --- AM Mejorada ---
                 # 1) Normalizar mensaje a [-1, 1]
@@ -219,49 +220,58 @@ class ModulationSimulator(QtWidgets.QWidget):
                 carrier_amplitude = 1.0
                 mod_index = 0.5  # Índice de modulación (0 < m < 1 para AM convencional)
                 
-                # 3) Modulación
-                # s(t) = Ac * [1 + m * msg_norm(t)] * cos(2*pi*fc*t)
+                # 3) Ajustar longitudes
+                min_length = min(len(msg_norm), len(carrier), len(t))
+                msg_norm = msg_norm[:min_length]
+                carrier = carrier[:min_length]
+                t = t[:min_length]
+
+                # 4) Modulación
                 modulated = carrier_amplitude * (1 + mod_index * msg_norm) * carrier
 
-                # 4) Demodulación mediante detección de envolvente
-                #    a) Obtener la envolvente con transformada de Hilbert
+                # 5) Demodulación mediante detección de envolvente
                 analytic_signal = scipy.signal.hilbert(modulated)
                 envelope = np.abs(analytic_signal)
-                
-                #    b) El mensaje recuperado (aprox) = (envelope - Ac) / mod_index
-                #       (restamos la portadora y dividimos entre el índice)
+
+                #    a) Recuperar el mensaje original
                 demodulated = (envelope - carrier_amplitude) / mod_index
+
             elif mod_type == "FM":
-                # --- FM Mejorada ---
-                # 1) Normalizar mensaje a [-1, 1]
+                # 1) Normalizar el mensaje para asegurar variaciones
                 if np.max(np.abs(message)) > 0:
                     msg_norm = message / np.max(np.abs(message))
                 else:
                     msg_norm = message
 
-                # 2) Parámetros
-                freq_dev = 5.0  # Desviación de frecuencia (Hz)
+                # 2) Parámetros mejorados
+                freq_dev = 50.0  # Aumentar la desviación de frecuencia para mayor variabilidad
                 carrier_amplitude = 1.0
 
-                # 3) Construir fase integrada
-                #    s(t) = Ac * cos(2*pi*fc*t + 2*pi*freq_dev * integral(msg_norm))
-                dt = t[1] - t[0]
+                # 3) Ajustar longitud de señal
+                min_length = min(len(msg_norm), len(t))
+                msg_norm = msg_norm[:min_length]
+                t = t[:min_length]
+
+                # 4) Modulación FM
+                dt = np.mean(np.diff(t))
                 phase_deviation = 2 * np.pi * freq_dev * np.cumsum(msg_norm) * dt
                 total_phase = 2 * np.pi * self.freq_carrier.value() * t + phase_deviation
                 modulated = carrier_amplitude * np.cos(total_phase)
 
-                # 4) Demodulación: derivar la fase instantánea
-                #    a) Obtener señal analítica
-                analytic_signal = scipy.signal.hilbert(modulated)
-                inst_phase = np.unwrap(np.angle(analytic_signal))
+                # 5) Demodulación FM mejorada
+                analytic_signal = scipy.signal.hilbert(modulated)  # Obtener señal analítica
+                inst_phase = np.unwrap(np.angle(analytic_signal))  # Obtener fase instantánea
+                inst_freq = np.gradient(inst_phase, dt) / (2.0 * np.pi)  # Derivar fase para obtener frecuencia instantánea
 
-                #    b) Frecuencia instantánea = (1 / 2π) * d(phase)/dt
-                #       => (inst_phase[i+1] - inst_phase[i]) / (2π * dt)
-                #       => restar la portadora y escalar por freq_dev
-                inst_freq = np.gradient(inst_phase, dt) / (2.0 * np.pi)
-
-                #    c) Recuperar la señal => (inst_freq - fc) / freq_dev
+                # 6) Recuperar mensaje con menos ruido
                 demodulated = (inst_freq - self.freq_carrier.value()) / freq_dev
+
+                # 7) Aplicar filtrado suave
+                b, a = scipy.signal.butter(5, 0.05, 'low')  # Filtro pasa-bajo
+                demodulated_filtered = scipy.signal.filtfilt(b, a, demodulated)
+
+                # 8) Ajustar amplitud para que coincida con el mensaje original
+                demodulated_final = demodulated_filtered * (np.max(np.abs(message)) / np.max(np.abs(demodulated_filtered)))
             elif mod_type == "PM":
                 # Improved PM implementation
                 phase_deviation = self.phase_dev.value()/10.0 * np.pi  # Adjustable phase deviation
