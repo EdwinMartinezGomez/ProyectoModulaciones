@@ -7,6 +7,9 @@ from matplotlib.animation import FuncAnimation
 import sounddevice as sd
 from scipy.fft import fft, fftfreq
 from scipy.signal import hilbert
+import scipy.signal as signal
+import scipy
+
 
 class ModulationSimulator(QtWidgets.QWidget):
     def __init__(self):
@@ -184,10 +187,18 @@ class ModulationSimulator(QtWidgets.QWidget):
         if self.audio_data is not None:
             return np.interp(t, np.linspace(0, 1, len(self.audio_data)), self.audio_data)
         return np.zeros_like(t)
+    
+    def apply_bandpass_filter(self, signal, lowcut, highcut, fs, order=4):
+        nyquist = 0.5 * fs
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = scipy.signal.butter(order, [low, high], btype='band')
+        return scipy.signal.filtfilt(b, a, signal)
 
     def apply_modulation(self, mod_type, message, carrier, t):
         """Aplica la modulación seleccionada."""
         try:
+            sampling_rate = len(t)
             if mod_type == "AM":
                 modulated = (1 + message) * carrier
                 demodulated = np.abs(modulated) - 1
@@ -215,11 +226,60 @@ class ModulationSimulator(QtWidgets.QWidget):
                 threshold = (high_amplitude + low_amplitude) / 2
                 demodulated = np.where(demodulated > threshold, high_amplitude, low_amplitude)
             elif mod_type == "FSK":
-                modulated = np.sin(2 * np.pi * (self.freq_carrier.value() + message * 10) * t)
-                demodulated = np.gradient(np.unwrap(np.angle(modulated)))
+                f1 = self.freq_carrier.value()
+                f2 = f1 + 100 
+
+                samples_per_bit = int(len(t) / len(message))
+                duration = t[-1] - t[0]
+                bit_duration = duration / len(message)
+
+                modulated = np.zeros(len(t))
+                phase = 0
+
+                for i, bit in enumerate(message):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+                    freq = f2 if bit == 1 else f1
+                    t_rel = t[start:end] - t[start]
+                    modulated[start:end] = np.sin(phase + 2 * np.pi * freq * t_rel)
+                    phase += 2 * np.pi * freq * (t[end-1] - t[start]) + 2 * np.pi * freq * (t[1] - t[0])
+
+                low_f1 = max(f1 - 30, 1)
+                high_f1 = max(f1 + 30, low_f1 + 1)
+                low_f2 = max(f2 - 30, 1)
+                high_f2 = max(f2 + 30, low_f2 + 1)
+
+                filtered_f1 = self.apply_bandpass_filter(modulated, low_f1, high_f1, sampling_rate)
+                filtered_f2 = self.apply_bandpass_filter(modulated, low_f2, high_f2, sampling_rate)
+
+                energy_f1 = np.array([np.sum(filtered_f1[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
+                energy_f2 = np.array([np.sum(filtered_f2[i * samples_per_bit:(i + 1) * samples_per_bit]**2) for i in range(len(message))])
+
+                threshold = (np.max(energy_f1) + np.max(energy_f2)) / 2
+                demodulated_bits = (energy_f2 > energy_f1).astype(int)
+
+                demodulated = np.zeros(len(t))
+                for i, bit in enumerate(demodulated_bits):
+                    start = i * samples_per_bit
+                    end = (i + 1) * samples_per_bit
+                    demodulated[start:end] = bit
+
+                from scipy.signal import medfilt
+                demodulated = medfilt(demodulated, kernel_size=5)
+
             elif mod_type == "PSK":
-                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * (message > 0))
-                demodulated = np.unwrap(np.angle(modulated))
+                modulated = np.sin(2 * np.pi * self.freq_carrier.value() * t + np.pi * message)
+
+                # Demodulación coherente
+                carrier_ref = np.sin(2 * np.pi * self.freq_carrier.value() * t)
+                mixed = modulated * carrier_ref
+
+                # Filtro pasa bajos (promedio móvil)
+                kernel_size = 50
+                filtered = np.convolve(mixed, np.ones(kernel_size) / kernel_size, mode='same')
+
+                demodulated = (filtered < 0).astype(float)
+
             elif mod_type == "PCM":
                 modulated = np.round(message * 2) / 2
                 demodulated = modulated
